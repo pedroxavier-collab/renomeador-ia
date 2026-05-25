@@ -32,6 +32,17 @@ TIPOS_ACEITOS = ["pdf", "txt", "png", "jpg", "jpeg"]
 # Tamanho máximo do nome de arquivo (sem extensão) para evitar nomes gigantes
 TAMANHO_MAX_NOME = 80
 
+# Pausa (em segundos) entre o processamento de cada arquivo.
+# O plano grátis do Gemini permite ~15 requisições por minuto.
+# 4 segundos = 15 req/min, ficando bem dentro do limite.
+PAUSA_ENTRE_ARQUIVOS = 4
+
+# Quantas vezes tentar de novo se a API responder rate limit (429)
+MAX_TENTATIVAS = 3
+
+# Pausa (em segundos) ao receber rate limit, antes de tentar de novo
+PAUSA_APOS_RATE_LIMIT = 30
+
 
 # =========================================================================
 # FUNÇÕES AUXILIARES (a lógica do app fica separada da UI)
@@ -141,6 +152,44 @@ def gerar_nome_via_gemini(conteudo_bytes: bytes,
                 pass
 
 
+def gerar_nome_com_retry(conteudo_bytes: bytes,
+                         nome_original: str,
+                         api_key: str,
+                         callback_status=None) -> str:
+    """
+    Envolve a chamada ao Gemini com retry automático em caso de rate limit.
+    Se cair em 429, espera e tenta de novo até MAX_TENTATIVAS vezes.
+
+    'callback_status' é uma função opcional pra mostrar mensagens na tela
+    durante a espera (assim o usuário sabe que o app não travou).
+    """
+    ultimo_erro = None
+
+    for tentativa in range(1, MAX_TENTATIVAS + 1):
+        try:
+            return gerar_nome_via_gemini(conteudo_bytes, nome_original, api_key)
+        except Exception as erro:
+            ultimo_erro = erro
+            msg = str(erro).lower()
+            eh_rate_limit = "429" in msg or "rate" in msg or "quota" in msg
+
+            # Se não for rate limit, não adianta tentar de novo — propaga o erro
+            if not eh_rate_limit:
+                raise
+
+            # Se ainda tem tentativa, espera e tenta de novo
+            if tentativa < MAX_TENTATIVAS:
+                if callback_status:
+                    callback_status(
+                        f"⏳ Limite atingido. Aguardando {PAUSA_APOS_RATE_LIMIT}s "
+                        f"e tentando de novo (tentativa {tentativa + 1}/{MAX_TENTATIVAS})..."
+                    )
+                time.sleep(PAUSA_APOS_RATE_LIMIT)
+
+    # Se chegou aqui, esgotou as tentativas
+    raise ultimo_erro
+
+
 def evitar_nome_duplicado(nome: str, ja_usados: dict) -> str:
     """
     Se dois arquivos receberem o mesmo nome do Gemini, adiciona _2, _3, etc.
@@ -241,11 +290,18 @@ if processar:
         try:
             conteudo = arquivo.getvalue()
 
-            # Chama a IA — esta é a parte que pode falhar
-            novo_nome = gerar_nome_via_gemini(
+            # Callback pra mostrar mensagens durante esperas de rate limit
+            placeholder_status = log.empty()
+
+            def avisar(msg):
+                placeholder_status.info(msg)
+
+            # Chama a IA com retry automático em caso de rate limit
+            novo_nome = gerar_nome_com_retry(
                 conteudo_bytes=conteudo,
                 nome_original=arquivo.name,
                 api_key=api_key,
+                callback_status=avisar,
             )
             novo_nome = evitar_nome_duplicado(novo_nome, nomes_ja_usados)
 
@@ -255,8 +311,7 @@ if processar:
                 f.write(conteudo)
 
             resumo["sucesso"] += 1
-            with log:
-                st.success(f"✅ `{arquivo.name}` → `{novo_nome}`")
+            placeholder_status.success(f"✅ `{arquivo.name}` → `{novo_nome}`")
 
         except Exception as erro:
             # Não interrompe o processamento — apenas avisa e segue
@@ -265,7 +320,10 @@ if processar:
 
             # Mensagem mais amigável para erros conhecidos
             if "429" in mensagem or "quota" in mensagem.lower() or "rate" in mensagem.lower():
-                texto_amigavel = "Limite de requisições da API atingido. Aguarde alguns segundos."
+                texto_amigavel = (
+                    "Limite de requisições da API atingido mesmo após várias tentativas. "
+                    "Espere 1 minuto e tente novamente."
+                )
             elif "401" in mensagem or "API key" in mensagem:
                 texto_amigavel = "Chave da API inválida ou sem permissão."
             else:
@@ -274,9 +332,10 @@ if processar:
             with log:
                 st.error(f"❌ `{arquivo.name}` — {texto_amigavel}")
 
-            # Pequena pausa em caso de rate limit
-            if "rate" in mensagem.lower() or "429" in mensagem:
-                time.sleep(2)
+        # Pausa entre arquivos pra respeitar o limite de requisições do Gemini
+        # (só pausa se ainda tem mais arquivos pra processar)
+        if indice < total:
+            time.sleep(PAUSA_ENTRE_ARQUIVOS)
 
     # Finaliza a barra
     barra_progresso.progress(1.0, text="Processamento concluído!")
