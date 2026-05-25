@@ -1,0 +1,19 @@
+# Tema visual do Streamlit — Identidade Expanzio+
+# Este arquivo define as cores base do app.
+# Mais detalhes: https://docs.streamlit.io/develop/concepts/configuration/theming
+
+[theme]
+# Cor de destaque (botões, links, barras)
+primaryColor = "#FB4710"
+
+# Cor de fundo principal do app
+backgroundColor = "#000000"
+
+# Cor de fundo dos componentes (sidebar, cards)
+secondaryBackgroundColor = "#1A1A1A"
+
+# Cor padrão de texto
+textColor = "#FFFFFF"
+
+# Fonte
+font = "sans serif"
