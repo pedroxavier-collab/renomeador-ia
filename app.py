@@ -23,8 +23,8 @@ import google.generativeai as genai
 # =========================================================================
 
 # Modelo do Gemini que será usado. "flash" é rápido e barato — ideal para
-# este caso de uso. Você pode trocar por "gemini-2.0-flash" se preferir.
-MODEL_NAME = "gemini-1.5-flash"
+# este caso de uso. Outras opções: "gemini-2.0-flash" ou "gemini-2.5-pro".
+MODEL_NAME = "gemini-2.5-flash"
 
 # Tipos de arquivo aceitos no upload
 TIPOS_ACEITOS = ["pdf", "txt", "png", "jpg", "jpeg"]
