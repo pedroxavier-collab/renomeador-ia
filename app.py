@@ -43,10 +43,52 @@ MAX_TENTATIVAS = 3
 # Pausa (em segundos) ao receber rate limit, antes de tentar de novo
 PAUSA_APOS_RATE_LIMIT = 30
 
+# Categorias permitidas para o TIPO do documento.
+# A IA é OBRIGADA a escolher uma destas. Se nada se encaixar, usa OUTRO.
+# Pra adicionar/remover categorias, basta editar esta lista.
+CATEGORIAS_TIPO = [
+    "FATURA",
+    "CONTRATO",
+    "RECIBO",
+    "NOTA_FISCAL",
+    "EXTRATO",
+    "PROPOSTA",
+    "RELATORIO",
+    "OUTRO",
+]
+
 
 # =========================================================================
 # FUNÇÕES AUXILIARES (a lógica do app fica separada da UI)
 # =========================================================================
+
+def validar_e_corrigir_padrao(nome: str, extensao: str) -> str:
+    """
+    Verifica se o nome retornado pela IA segue o padrão CLIENTE_TIPO_Descricao.
+    Se o TIPO não estiver na lista de categorias permitidas, força para OUTRO.
+    Funciona como uma rede de segurança caso a IA não siga 100% as instruções.
+    """
+    # Tira a extensão (vamos recolocar no final)
+    base = os.path.splitext(nome)[0]
+
+    # Quebra em partes separadas por _
+    partes = base.split("_")
+
+    if len(partes) < 3:
+        # Não veio no formato esperado — devolve como veio (já está higienizado)
+        return nome
+
+    # Estrutura: CLIENTE_TIPO_Descricao (pode ter mais _ na descrição)
+    cliente = partes[0].upper()
+    tipo = partes[1].upper()
+    descricao = "_".join(partes[2:])  # Reune o resto
+
+    # Se o TIPO não estiver na lista oficial, força OUTRO
+    if tipo not in CATEGORIAS_TIPO:
+        tipo = "OUTRO"
+
+    return f"{cliente}_{tipo}_{descricao}{extensao}"
+
 
 def higienizar_nome(nome_bruto: str, extensao_original: str) -> str:
     """
@@ -112,23 +154,45 @@ def gerar_nome_via_gemini(conteudo_bytes: bytes,
         arquivo_no_gemini = genai.upload_file(path=arquivo_temp.name)
 
         # 2) Prompt — instruções bem específicas pra IA não viajar
+        categorias_str = ", ".join(CATEGORIAS_TIPO)
         prompt = (
-            "Analise o conteúdo deste arquivo e gere um nome curto, "
-            "descritivo e padronizado para ele.\n\n"
-            "REGRAS OBRIGATÓRIAS (siga à risca):\n"
-            "- Responda APENAS com o nome do arquivo. Nada mais.\n"
-            "- NÃO use markdown, aspas, ou qualquer formatação.\n"
+            "Analise o conteúdo deste arquivo e gere um nome padronizado seguindo "
+            "EXATAMENTE o formato abaixo. Esta é uma tarefa crítica de classificação.\n\n"
+            "FORMATO OBRIGATÓRIO:\n"
+            "CLIENTE_TIPO_Descricao\n\n"
+            "REGRAS DE CADA PARTE:\n\n"
+            "1) CLIENTE (primeira parte, em MAIÚSCULAS):\n"
+            "   - Extraia o nome do cliente, empresa, fornecedor ou pessoa principal "
+            "do documento.\n"
+            "   - Use apenas letras (sem acento), números e una palavras compostas sem "
+            "espaço (ex: BANCOITAU, MERCADOLIVRE, JOAOSILVA).\n"
+            "   - Se o documento NÃO mencionar nenhum cliente identificável, use: "
+            "INDEFINIDO\n\n"
+            f"2) TIPO (segunda parte, em MAIÚSCULAS):\n"
+            f"   - Você DEVE escolher OBRIGATORIAMENTE uma destas categorias: "
+            f"{categorias_str}\n"
+            f"   - Não invente novas categorias. Não traduza. Não adapte.\n"
+            f"   - Se nenhuma se encaixar bem, use: OUTRO\n\n"
+            "3) Descricao (terceira parte, em CamelCase):\n"
+            "   - Descrição curta com detalhes que diferenciam este documento "
+            "(data, número, mês, assunto).\n"
+            "   - Use CamelCase: primeira letra de cada palavra em maiúscula, "
+            "sem espaços (ex: Janeiro2026, Pedido12345, ReuniaoMarketing).\n"
+            "   - Máximo 40 caracteres nesta parte.\n\n"
+            "REGRAS GERAIS:\n"
+            "- Responda APENAS com o nome final, nada mais.\n"
+            "- NÃO use markdown, aspas ou explicações.\n"
             "- NÃO inclua a extensão do arquivo.\n"
-            "- Use APENAS letras (sem acento), números, underline (_) "
-            "e hífen (-).\n"
-            "- NÃO use espaços, barras, dois-pontos ou caracteres especiais.\n"
-            "- Máximo de 60 caracteres.\n"
-            "- Seja descritivo e útil.\n\n"
-            "Exemplos de respostas corretas:\n"
-            "Fatura_Energia_Janeiro_2026\n"
-            "Contrato_Aluguel_Joao_Silva_2025\n"
-            "Foto_Cachorro_Praia\n"
-            "Comprovante_Pix_Loja_Tech\n"
+            "- Use APENAS letras (sem acento), números e underline (_).\n"
+            "- As três partes são separadas por UM underline (_).\n"
+            "- Total máximo: 80 caracteres.\n\n"
+            "EXEMPLOS DE RESPOSTAS CORRETAS:\n"
+            "VIVO_FATURA_Janeiro2026\n"
+            "JOAOSILVA_CONTRATO_AluguelImovel2025\n"
+            "MERCADOLIVRE_NOTA_FISCAL_Pedido98765\n"
+            "BANCOITAU_EXTRATO_Dezembro2025\n"
+            "INDEFINIDO_RECIBO_PagamentoServico\n"
+            "MICROSOFT_PROPOSTA_LicencaOffice2026\n"
         )
 
         # 3) Chama o modelo passando o prompt + o arquivo
@@ -136,7 +200,9 @@ def gerar_nome_via_gemini(conteudo_bytes: bytes,
         resposta = modelo.generate_content([prompt, arquivo_no_gemini])
 
         nome_bruto = resposta.text or ""
-        return higienizar_nome(nome_bruto, extensao)
+        nome_limpo = higienizar_nome(nome_bruto, extensao)
+        # Garante que o padrão CLIENTE_TIPO_Descricao foi respeitado
+        return validar_e_corrigir_padrao(nome_limpo, extensao)
 
     finally:
         # Limpeza: apaga o arquivo temporário local
@@ -378,6 +444,12 @@ with st.sidebar:
             type="password",
             help="Configure GEMINI_API_KEY nos Secrets do Streamlit.",
         )
+
+    st.markdown("---")
+    st.markdown("**📐 Padrão de nomenclatura:**")
+    st.code("CLIENTE_TIPO_Descricao", language=None)
+    st.caption("Categorias disponíveis:")
+    st.caption(" · ".join(CATEGORIAS_TIPO))
 
     st.markdown("---")
     st.markdown(
