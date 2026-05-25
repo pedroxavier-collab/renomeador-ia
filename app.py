@@ -218,6 +218,25 @@ def criar_zip_em_memoria(pasta_arquivos: str) -> bytes:
     return buffer.getvalue()
 
 
+def carregar_api_key() -> str:
+    """
+    Tenta carregar a chave da API em ordem de prioridade:
+    1. Dos 'Secrets' do Streamlit (produção / Streamlit Cloud)
+    2. De variável de ambiente GEMINI_API_KEY (rodando local)
+    3. Retorna string vazia se não encontrar (aí pedimos pro usuário)
+    """
+    # Tenta pegar dos Secrets do Streamlit
+    try:
+        chave = st.secrets.get("GEMINI_API_KEY", "")
+        if chave:
+            return chave
+    except Exception:
+        pass  # st.secrets pode não existir no ambiente local
+
+    # Tenta pegar de variável de ambiente
+    return os.environ.get("GEMINI_API_KEY", "")
+
+
 # =========================================================================
 # INTERFACE (Streamlit)
 # =========================================================================
@@ -231,21 +250,32 @@ st.set_page_config(
 st.title("📁 Renomeador Inteligente de Arquivos")
 st.caption("Use a IA do Google Gemini para renomear seus arquivos automaticamente.")
 
-# ---- Barra lateral: configuração ---------------------------------------
+# Tenta carregar a chave automaticamente (Secrets ou variável de ambiente)
+api_key = carregar_api_key()
+chave_embutida = bool(api_key)
+
+# ---- Barra lateral ------------------------------------------------------
 with st.sidebar:
-    st.header("⚙️ Configuração")
-    api_key = st.text_input(
-        "Chave da API Gemini",
-        type="password",
-        help="Pegue sua chave gratuita em https://aistudio.google.com/apikey",
-    )
+    st.header("ℹ️ Informações")
+
+    if chave_embutida:
+        st.success("✅ Chave da API configurada")
+    else:
+        # Fallback: se não houver chave configurada, pede ao usuário
+        st.warning("⚠️ Chave da API não configurada")
+        api_key = st.text_input(
+            "Chave da API Gemini",
+            type="password",
+            help="Configure GEMINI_API_KEY nos Secrets do Streamlit.",
+        )
+
     st.markdown("---")
     st.markdown(
         "**Formatos suportados:**\n"
         "- PDF\n- TXT\n- PNG\n- JPG / JPEG"
     )
     st.markdown("---")
-    st.caption(f"Modelo em uso: `{MODEL_NAME}`")
+    st.caption(f"Modelo: `{MODEL_NAME}`")
 
 # ---- Área principal: upload --------------------------------------------
 arquivos_enviados = st.file_uploader(
@@ -260,7 +290,10 @@ if arquivos_enviados:
 # Avisos para o usuário antes de processar
 botao_desabilitado = not (arquivos_enviados and api_key)
 if arquivos_enviados and not api_key:
-    st.warning("⚠️ Informe sua chave da API Gemini na barra lateral.")
+    st.error(
+        "⚠️ A chave da API não foi configurada pelo administrador. "
+        "Contate o responsável pela aplicação."
+    )
 
 processar = st.button(
     "🚀 Processar Arquivos",
