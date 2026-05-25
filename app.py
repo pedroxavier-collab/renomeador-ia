@@ -331,6 +331,9 @@ if processar:
 
             with log:
                 st.error(f"❌ `{arquivo.name}` — {texto_amigavel}")
+                # Mostra a mensagem técnica completa pra ajudar no diagnóstico
+                with st.expander("🔍 Ver detalhes técnicos do erro"):
+                    st.code(mensagem, language="text")
 
         # Pausa entre arquivos pra respeitar o limite de requisições do Gemini
         # (só pausa se ainda tem mais arquivos pra processar)
