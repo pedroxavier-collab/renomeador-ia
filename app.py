@@ -43,52 +43,10 @@ MAX_TENTATIVAS = 3
 # Pausa (em segundos) ao receber rate limit, antes de tentar de novo
 PAUSA_APOS_RATE_LIMIT = 30
 
-# Categorias permitidas para o TIPO do documento.
-# A IA é OBRIGADA a escolher uma destas. Se nada se encaixar, usa OUTRO.
-# Pra adicionar/remover categorias, basta editar esta lista.
-CATEGORIAS_TIPO = [
-    "FATURA",
-    "CONTRATO",
-    "RECIBO",
-    "NOTA_FISCAL",
-    "EXTRATO",
-    "PROPOSTA",
-    "RELATORIO",
-    "OUTRO",
-]
-
 
 # =========================================================================
 # FUNÇÕES AUXILIARES (a lógica do app fica separada da UI)
 # =========================================================================
-
-def validar_e_corrigir_padrao(nome: str, extensao: str) -> str:
-    """
-    Verifica se o nome retornado pela IA segue o padrão CLIENTE_TIPO_Descricao.
-    Se o TIPO não estiver na lista de categorias permitidas, força para OUTRO.
-    Funciona como uma rede de segurança caso a IA não siga 100% as instruções.
-    """
-    # Tira a extensão (vamos recolocar no final)
-    base = os.path.splitext(nome)[0]
-
-    # Quebra em partes separadas por _
-    partes = base.split("_")
-
-    if len(partes) < 3:
-        # Não veio no formato esperado — devolve como veio (já está higienizado)
-        return nome
-
-    # Estrutura: CLIENTE_TIPO_Descricao (pode ter mais _ na descrição)
-    cliente = partes[0].upper()
-    tipo = partes[1].upper()
-    descricao = "_".join(partes[2:])  # Reune o resto
-
-    # Se o TIPO não estiver na lista oficial, força OUTRO
-    if tipo not in CATEGORIAS_TIPO:
-        tipo = "OUTRO"
-
-    return f"{cliente}_{tipo}_{descricao}{extensao}"
-
 
 def higienizar_nome(nome_bruto: str, extensao_original: str) -> str:
     """
@@ -131,9 +89,13 @@ def higienizar_nome(nome_bruto: str, extensao_original: str) -> str:
 
 def gerar_nome_via_gemini(conteudo_bytes: bytes,
                           nome_original: str,
-                          api_key: str) -> str:
+                          api_key: str,
+                          cliente_manual: str = "") -> str:
     """
     Envia o arquivo para a API do Gemini e devolve o novo nome sugerido.
+
+    Se 'cliente_manual' for informado, ele será usado como CLIENTE no nome
+    final (a IA só precisa identificar TIPO e Descricao).
 
     Lança exceção em caso de erro (rate limit, arquivo inválido, etc.) — quem
     chama essa função decide como tratar.
@@ -153,26 +115,39 @@ def gerar_nome_via_gemini(conteudo_bytes: bytes,
         # 1) Faz upload do arquivo para os servidores do Gemini
         arquivo_no_gemini = genai.upload_file(path=arquivo_temp.name)
 
-        # 2) Prompt — instruções bem específicas pra IA não viajar
-        categorias_str = ", ".join(CATEGORIAS_TIPO)
+        # 2) Prompt — instruções específicas pra IA seguir o padrão
+        # Se o usuário informou o cliente manualmente, instruímos a IA a usar
+        # exatamente esse valor; senão, ela mesma extrai do conteúdo.
+        if cliente_manual:
+            instrucao_cliente = (
+                f"1) CLIENTE (primeira parte):\n"
+                f"   - USE EXATAMENTE este valor, sem alterar: {cliente_manual}\n"
+            )
+        else:
+            instrucao_cliente = (
+                "1) CLIENTE (primeira parte, em MAIÚSCULAS):\n"
+                "   - Extraia o nome do cliente, empresa, fornecedor ou pessoa "
+                "principal do documento.\n"
+                "   - Use apenas letras (sem acento) e números, unindo palavras "
+                "compostas sem espaço (ex: BANCOITAU, MERCADOLIVRE, JOAOSILVA).\n"
+                "   - Se o documento NÃO mencionar nenhum cliente identificável, "
+                "use: INDEFINIDO\n"
+            )
+
         prompt = (
             "Analise o conteúdo deste arquivo e gere um nome padronizado seguindo "
             "EXATAMENTE o formato abaixo. Esta é uma tarefa crítica de classificação.\n\n"
             "FORMATO OBRIGATÓRIO:\n"
             "CLIENTE_TIPO_Descricao\n\n"
             "REGRAS DE CADA PARTE:\n\n"
-            "1) CLIENTE (primeira parte, em MAIÚSCULAS):\n"
-            "   - Extraia o nome do cliente, empresa, fornecedor ou pessoa principal "
-            "do documento.\n"
-            "   - Use apenas letras (sem acento), números e una palavras compostas sem "
-            "espaço (ex: BANCOITAU, MERCADOLIVRE, JOAOSILVA).\n"
-            "   - Se o documento NÃO mencionar nenhum cliente identificável, use: "
-            "INDEFINIDO\n\n"
-            f"2) TIPO (segunda parte, em MAIÚSCULAS):\n"
-            f"   - Você DEVE escolher OBRIGATORIAMENTE uma destas categorias: "
-            f"{categorias_str}\n"
-            f"   - Não invente novas categorias. Não traduza. Não adapte.\n"
-            f"   - Se nenhuma se encaixar bem, use: OUTRO\n\n"
+            f"{instrucao_cliente}\n"
+            "2) TIPO (segunda parte, em MAIÚSCULAS):\n"
+            "   - Identifique qual é o tipo do documento de forma clara e direta.\n"
+            "   - Use uma palavra só, em MAIÚSCULAS, sem acento.\n"
+            "   - Seja específico: FATURA, CONTRATO, RECIBO, NOTAFISCAL, "
+            "EXTRATO, PROPOSTA, RELATORIO, HOLERITE, BOLETO, COMPROVANTE, "
+            "ORCAMENTO, CURRICULO, ATA, OFICIO, etc.\n"
+            "   - Escolha sempre o termo mais preciso pro conteúdo real.\n\n"
             "3) Descricao (terceira parte, em CamelCase):\n"
             "   - Descrição curta com detalhes que diferenciam este documento "
             "(data, número, mês, assunto).\n"
@@ -189,10 +164,10 @@ def gerar_nome_via_gemini(conteudo_bytes: bytes,
             "EXEMPLOS DE RESPOSTAS CORRETAS:\n"
             "VIVO_FATURA_Janeiro2026\n"
             "JOAOSILVA_CONTRATO_AluguelImovel2025\n"
-            "MERCADOLIVRE_NOTA_FISCAL_Pedido98765\n"
+            "MERCADOLIVRE_NOTAFISCAL_Pedido98765\n"
             "BANCOITAU_EXTRATO_Dezembro2025\n"
-            "INDEFINIDO_RECIBO_PagamentoServico\n"
             "MICROSOFT_PROPOSTA_LicencaOffice2026\n"
+            "RH_HOLERITE_Maio2026\n"
         )
 
         # 3) Chama o modelo passando o prompt + o arquivo
@@ -200,9 +175,7 @@ def gerar_nome_via_gemini(conteudo_bytes: bytes,
         resposta = modelo.generate_content([prompt, arquivo_no_gemini])
 
         nome_bruto = resposta.text or ""
-        nome_limpo = higienizar_nome(nome_bruto, extensao)
-        # Garante que o padrão CLIENTE_TIPO_Descricao foi respeitado
-        return validar_e_corrigir_padrao(nome_limpo, extensao)
+        return higienizar_nome(nome_bruto, extensao)
 
     finally:
         # Limpeza: apaga o arquivo temporário local
@@ -221,6 +194,7 @@ def gerar_nome_via_gemini(conteudo_bytes: bytes,
 def gerar_nome_com_retry(conteudo_bytes: bytes,
                          nome_original: str,
                          api_key: str,
+                         cliente_manual: str = "",
                          callback_status=None) -> str:
     """
     Envolve a chamada ao Gemini com retry automático em caso de rate limit.
@@ -233,7 +207,9 @@ def gerar_nome_com_retry(conteudo_bytes: bytes,
 
     for tentativa in range(1, MAX_TENTATIVAS + 1):
         try:
-            return gerar_nome_via_gemini(conteudo_bytes, nome_original, api_key)
+            return gerar_nome_via_gemini(
+                conteudo_bytes, nome_original, api_key, cliente_manual
+            )
         except Exception as erro:
             ultimo_erro = erro
             msg = str(erro).lower()
@@ -448,8 +424,7 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("**📐 Padrão de nomenclatura:**")
     st.code("CLIENTE_TIPO_Descricao", language=None)
-    st.caption("Categorias disponíveis:")
-    st.caption(" · ".join(CATEGORIAS_TIPO))
+    st.caption("Ex: VIVO_FATURA_Janeiro2026")
 
     st.markdown("---")
     st.markdown(
@@ -465,6 +440,36 @@ arquivos_enviados = st.file_uploader(
     type=TIPOS_ACEITOS,
     accept_multiple_files=True,
 )
+
+# Campo opcional pro usuário informar o cliente
+# (se informado, todos os arquivos serão nomeados com esse cliente)
+cliente_manual_raw = st.text_input(
+    "Cliente (opcional)",
+    placeholder="Ex: VIVO, BANCO ITAÚ, JOÃO SILVA — deixe vazio pra IA detectar automaticamente",
+    help=(
+        "Se você preencher, este nome será usado como CLIENTE em TODOS os arquivos "
+        "deste processamento. Se deixar vazio, a IA tenta identificar pelo conteúdo "
+        "de cada documento."
+    ),
+)
+
+# Higieniza o cliente manual: vira MAIÚSCULAS, sem espaços, sem acentos
+def _formatar_cliente_manual(texto: str) -> str:
+    import unicodedata
+    if not texto:
+        return ""
+    # Remove acentos
+    nfkd = unicodedata.normalize("NFKD", texto)
+    sem_acento = "".join(c for c in nfkd if not unicodedata.combining(c))
+    # Mantém só letras e números, vira MAIÚSCULAS, sem espaços
+    limpo = re.sub(r"[^a-zA-Z0-9]", "", sem_acento).upper()
+    return limpo
+
+cliente_manual = _formatar_cliente_manual(cliente_manual_raw)
+
+# Mostra preview do que vai virar (útil se o usuário digitou com acentos/espaços)
+if cliente_manual_raw and cliente_manual != cliente_manual_raw:
+    st.caption(f"✏️ Cliente formatado: `{cliente_manual}`")
 
 if arquivos_enviados:
     st.info(f"📎 {len(arquivos_enviados)} arquivo(s) selecionado(s).")
@@ -516,6 +521,7 @@ if processar:
                 conteudo_bytes=conteudo,
                 nome_original=arquivo.name,
                 api_key=api_key,
+                cliente_manual=cliente_manual,
                 callback_status=avisar,
             )
             novo_nome = evitar_nome_duplicado(novo_nome, nomes_ja_usados)
