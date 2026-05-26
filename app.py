@@ -319,10 +319,16 @@ COR_CINZA = "#666666"
 # CSS customizado para refinar a aparência além do tema base
 CSS_CUSTOMIZADO = f"""
 <style>
-    /* Esconde menu, footer e header padrão do Streamlit */
+    /* Esconde menu e footer padrão do Streamlit (mas mantém o header
+       pra preservar o botão que abre/fecha a sidebar) */
     #MainMenu {{ visibility: hidden; }}
     footer {{ visibility: hidden; }}
-    header {{ visibility: hidden; }}
+
+    /* Header transparente: invisível visualmente, mas funcional
+       (o botão de toggle da sidebar continua clicável) */
+    header[data-testid="stHeader"] {{
+        background-color: transparent;
+    }}
 
     /* Container principal: respiro no topo */
     .main .block-container {{
