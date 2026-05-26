@@ -454,20 +454,13 @@ with st.sidebar:
     st.markdown("---")
     st.caption(f"Modelo: `{MODEL_NAME}`")
 
-# ---- Área principal: upload --------------------------------------------
-arquivos_enviados = st.file_uploader(
-    "Selecione os arquivos para renomear",
-    type=TIPOS_ACEITOS,
-    accept_multiple_files=True,
-)
-
 # =========================================================================
-# CAMPOS DO PADRÃO EXPANZIO
+# ETAPA 1 — CONFIGURAÇÃO DO PADRÃO
 # =========================================================================
 # O usuário define CLIENTE, número inicial e revisão.
 # A IA gera apenas a parte central (NOME ABREVIADO) baseada no conteúdo.
 
-st.markdown("### Padrão de nomenclatura")
+st.markdown("### 1. Configure o padrão")
 st.caption("Formato final: `CLIENTE-000-NOME ABREVIADO-REVISÃO.ext`")
 
 # Cliente — obrigatório
@@ -528,8 +521,51 @@ with col2:
         ),
     )
 
+st.markdown("---")
+
+# =========================================================================
+# ETAPA 2 — UPLOAD DOS ARQUIVOS
+# =========================================================================
+
+st.markdown("### 2. Selecione os arquivos")
+
+arquivos_enviados = st.file_uploader(
+    "Arraste os arquivos aqui ou clique para selecionar",
+    type=TIPOS_ACEITOS,
+    accept_multiple_files=True,
+    label_visibility="collapsed",
+)
+
 if arquivos_enviados:
-    st.info(f"📎 {len(arquivos_enviados)} arquivo(s) selecionado(s).")
+    st.caption(f"📎 {len(arquivos_enviados)} arquivo(s) selecionado(s)")
+
+# =========================================================================
+# ETAPA 3 — PRÉ-VISUALIZAÇÃO E PROCESSAMENTO
+# =========================================================================
+
+# Mostra pré-visualização dos nomes finais quando tudo estiver pronto
+if arquivos_enviados and cliente:
+    st.markdown("---")
+    st.markdown("### 3. Confirme e processe")
+
+    # Monta a lista de nomes que serão gerados (com placeholder pra parte da IA)
+    with st.container():
+        st.markdown("**📋 Pré-visualização dos nomes finais:**")
+        st.caption(
+            "A parte `[NOME GERADO PELA IA]` será preenchida automaticamente "
+            "com base no conteúdo de cada arquivo."
+        )
+
+        # Lista os nomes em um bloco de código (visual limpo, fácil de comparar)
+        linhas_preview = []
+        for indice, arquivo in enumerate(arquivos_enviados, start=1):
+            numero_arq = int(numero_inicial) + (indice - 1)
+            ext = os.path.splitext(arquivo.name)[1].lower()
+            preview = f"{cliente}-{numero_arq:03d}-[NOME GERADO PELA IA]-{revisao.upper()}{ext}"
+            # Mostra original → preview pra fácil conferência
+            linhas_preview.append(f"{arquivo.name}  →  {preview}")
+
+        st.code("\n".join(linhas_preview), language=None)
 
 # Avisos para o usuário antes de processar
 botao_desabilitado = not (arquivos_enviados and api_key and cliente)
@@ -541,12 +577,16 @@ if arquivos_enviados and not api_key:
     )
 
 if arquivos_enviados and not cliente:
-    st.warning("⚠️ Informe o nome do cliente para continuar.")
+    st.warning("⚠️ Informe o nome do cliente na Etapa 1 para continuar.")
+
+if not arquivos_enviados and cliente:
+    st.info("Suba os arquivos na Etapa 2 para continuar.")
 
 processar = st.button(
-    "🚀 Processar Arquivos",
+    "Processar arquivos",
     type="primary",
     disabled=botao_desabilitado,
+    use_container_width=True,
 )
 
 # ---- Lógica de processamento -------------------------------------------
@@ -560,6 +600,10 @@ if processar:
     nomes_ja_usados: dict = {}
     resumo = {"sucesso": 0, "erro": 0}
     total = len(arquivos_enviados)
+
+    # Lista pra montar a tabela final de resultados
+    # Cada item: {"Status": "...", "Arquivo original": "...", "Novo nome": "..."}
+    tabela_resultados = []
 
     for indice, arquivo in enumerate(arquivos_enviados, start=1):
         progresso = (indice - 1) / total
@@ -606,7 +650,14 @@ if processar:
                 f.write(conteudo)
 
             resumo["sucesso"] += 1
-            placeholder_status.success(f"✅ `{arquivo.name}` → `{novo_nome}`")
+            placeholder_status.success(f"✅ {arquivo.name} → {novo_nome}")
+
+            # Adiciona à tabela final
+            tabela_resultados.append({
+                "Status": "✅",
+                "Arquivo original": arquivo.name,
+                "Novo nome": novo_nome,
+            })
 
         except Exception as erro:
             # Não interrompe o processamento — apenas avisa e segue
@@ -630,6 +681,13 @@ if processar:
                 with st.expander("🔍 Ver detalhes técnicos do erro"):
                     st.code(mensagem, language="text")
 
+            # Adiciona à tabela final como erro
+            tabela_resultados.append({
+                "Status": "❌",
+                "Arquivo original": arquivo.name,
+                "Novo nome": f"ERRO: {texto_amigavel}",
+            })
+
         # Pausa entre arquivos pra respeitar o limite de requisições do Gemini
         # (só pausa se ainda tem mais arquivos pra processar)
         if indice < total:
@@ -638,21 +696,50 @@ if processar:
     # Finaliza a barra
     barra_progresso.progress(1.0, text="Processamento concluído!")
 
-    # Resumo final
-    st.markdown("### 📊 Resumo")
-    col_a, col_b = st.columns(2)
-    col_a.metric("✅ Renomeados", resumo["sucesso"])
-    col_b.metric("❌ Falhas", resumo["erro"])
+    # =====================================================================
+    # APRESENTAÇÃO DOS RESULTADOS
+    # =====================================================================
+    st.markdown("---")
+    st.markdown("### Resultado")
+
+    # Métricas no topo
+    col_a, col_b, col_c = st.columns(3)
+    col_a.metric("Total processado", total)
+    col_b.metric("✅ Renomeados", resumo["sucesso"])
+    col_c.metric("❌ Falhas", resumo["erro"])
+
+    # Tabela comparativa: arquivo original × novo nome
+    if tabela_resultados:
+        st.dataframe(
+            tabela_resultados,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Status": st.column_config.TextColumn(
+                    "Status",
+                    width="small",
+                ),
+                "Arquivo original": st.column_config.TextColumn(
+                    "Arquivo original",
+                    width="medium",
+                ),
+                "Novo nome": st.column_config.TextColumn(
+                    "Novo nome",
+                    width="large",
+                ),
+            },
+        )
 
     # Botão de download — só se algum arquivo deu certo
     if resumo["sucesso"] > 0:
         zip_bytes = criar_zip_em_memoria(pasta_temp)
         st.download_button(
-            label="📥 Baixar tudo em .zip",
+            label="📥 Baixar arquivos renomeados (.zip)",
             data=zip_bytes,
             file_name="arquivos_renomeados.zip",
             mime="application/zip",
             type="primary",
+            use_container_width=True,
         )
     else:
         st.warning("Nenhum arquivo foi processado com sucesso.")
