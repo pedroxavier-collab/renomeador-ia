@@ -48,14 +48,40 @@ PAUSA_APOS_RATE_LIMIT = 30
 # FUNÇÕES AUXILIARES (a lógica do app fica separada da UI)
 # =========================================================================
 
+def montar_nome_padrao_expanzio(cliente: str,
+                                numero: int,
+                                nome_abreviado: str,
+                                revisao: str,
+                                extensao: str) -> str:
+    """
+    Monta o nome final no padrão Expanzio: CLIENTE-000-NOME ABREVIADO-REVISÃO
+
+    Exemplo: DIA-003-NOT. EXIG. PUBLI. 29-23-R00.pdf
+    """
+    # Numeração com 3 dígitos (1 → 001, 12 → 012)
+    numero_str = f"{numero:03d}"
+
+    # Garante que a revisão esteja no formato R00, R01, R02...
+    revisao = revisao.strip().upper()
+    if not revisao:
+        revisao = "R00"
+    elif not revisao.startswith("R"):
+        revisao = f"R{revisao}"
+
+    # Monta: CLIENTE-000-NOME ABREVIADO-R00.ext
+    nome_final = f"{cliente}-{numero_str}-{nome_abreviado}-{revisao}{extensao}"
+    return nome_final
+
+
 def higienizar_nome(nome_bruto: str, extensao_original: str) -> str:
     """
-    Limpa a resposta do Gemini para garantir que vire um nome de arquivo válido.
+    Limpa a resposta do Gemini garantindo que vire um nome de arquivo válido.
 
-    - Remove markdown (```, **, etc.)
-    - Remove aspas, espaços, barras, dois-pontos e outros caracteres proibidos
-    - Garante que a extensão original seja preservada
+    Padrão Expanzio: permite letras, números, pontos, espaços e hífens.
+    Remove apenas caracteres que quebram o sistema de arquivos.
     """
+    import unicodedata
+
     # Pega só a primeira linha (caso o Gemini retorne texto extra)
     nome = nome_bruto.strip().split("\n")[0].strip()
 
@@ -63,42 +89,44 @@ def higienizar_nome(nome_bruto: str, extensao_original: str) -> str:
     nome = nome.replace("```", "").replace("`", "")
     nome = nome.replace('"', "").replace("'", "")
 
+    # Remove acentos (á → a, ã → a, ç → c)
+    nfkd = unicodedata.normalize("NFKD", nome)
+    nome = "".join(c for c in nfkd if not unicodedata.combining(c))
+
     # Caracteres proibidos em sistemas de arquivos (Windows + Linux + Mac)
     nome = re.sub(r'[<>:"/\\|?*\n\r\t]', "", nome)
 
-    # Troca espaços por underline
-    nome = re.sub(r"\s+", "_", nome)
+    # Colapsa múltiplos espaços em um só
+    nome = re.sub(r" +", " ", nome).strip()
 
-    # Mantém apenas letras, números, underline, hífen e ponto
-    nome = re.sub(r"[^a-zA-Z0-9_\-\.]", "", nome)
+    # Mantém apenas letras, números, espaço, ponto, hífen e underline
+    nome = re.sub(r"[^a-zA-Z0-9 \.\-_]", "", nome)
 
-    # Remove pontos e underlines do começo e do fim
-    nome = nome.strip("._-")
+    # Remove pontos, espaços e hífens do começo e do fim
+    nome = nome.strip(" .-_")
 
-    # Se o Gemini já incluiu a extensão, remove para tratar separadamente
-    base, ext_resposta = os.path.splitext(nome)
-    if not base:
-        base = "arquivo_sem_nome"
+    if not nome:
+        nome = "arquivo sem nome"
 
-    # Limita o tamanho do nome
-    base = base[:TAMANHO_MAX_NOME]
+    # Limita o tamanho
+    nome = nome[:TAMANHO_MAX_NOME]
 
-    # Sempre força a extensão original (a do arquivo que o usuário enviou)
-    return f"{base}{extensao_original.lower()}"
+    # Garante a extensão original
+    return f"{nome}{extensao_original.lower()}"
 
 
 def gerar_nome_via_gemini(conteudo_bytes: bytes,
                           nome_original: str,
-                          api_key: str,
-                          cliente_manual: str = "") -> str:
+                          api_key: str) -> str:
     """
-    Envia o arquivo para a API do Gemini e devolve o novo nome sugerido.
+    Envia o arquivo para a API do Gemini e devolve apenas o NOME ABREVIADO
+    no padrão Expanzio (ex: "NOT. EXIG. PUBLI. 29-23").
 
-    Se 'cliente_manual' for informado, ele será usado como CLIENTE no nome
-    final (a IA só precisa identificar TIPO e Descricao).
+    O CLIENTE, número e revisão são adicionados depois pela função
+    montar_nome_padrao_expanzio() — assim a IA só se preocupa com a
+    identificação correta do tipo de documento.
 
-    Lança exceção em caso de erro (rate limit, arquivo inválido, etc.) — quem
-    chama essa função decide como tratar.
+    Lança exceção em caso de erro (rate limit, arquivo inválido, etc.).
     """
     genai.configure(api_key=api_key)
 
@@ -115,59 +143,45 @@ def gerar_nome_via_gemini(conteudo_bytes: bytes,
         # 1) Faz upload do arquivo para os servidores do Gemini
         arquivo_no_gemini = genai.upload_file(path=arquivo_temp.name)
 
-        # 2) Prompt — instruções específicas pra IA seguir o padrão
-        # Se o usuário informou o cliente manualmente, instruímos a IA a usar
-        # exatamente esse valor; senão, ela mesma extrai do conteúdo.
-        if cliente_manual:
-            instrucao_cliente = (
-                f"1) CLIENTE (primeira parte):\n"
-                f"   - USE EXATAMENTE este valor, sem alterar: {cliente_manual}\n"
-            )
-        else:
-            instrucao_cliente = (
-                "1) CLIENTE (primeira parte, em MAIÚSCULAS):\n"
-                "   - Extraia o nome do cliente, empresa, fornecedor ou pessoa "
-                "principal do documento.\n"
-                "   - Use apenas letras (sem acento) e números, unindo palavras "
-                "compostas sem espaço (ex: BANCOITAU, MERCADOLIVRE, JOAOSILVA).\n"
-                "   - Se o documento NÃO mencionar nenhum cliente identificável, "
-                "use: INDEFINIDO\n"
-            )
-
+        # 2) Prompt — agora a IA gera APENAS o NOME ABREVIADO.
+        # CLIENTE, numeração e revisão são definidos pelo usuário e adicionados
+        # depois pelo código. Isso deixa o resultado mais consistente.
         prompt = (
-            "Analise o conteúdo deste arquivo e gere um nome padronizado seguindo "
-            "EXATAMENTE o formato abaixo. Esta é uma tarefa crítica de classificação.\n\n"
-            "FORMATO OBRIGATÓRIO:\n"
-            "CLIENTE_TIPO_Descricao\n\n"
-            "REGRAS DE CADA PARTE:\n\n"
-            f"{instrucao_cliente}\n"
-            "2) TIPO (segunda parte, em MAIÚSCULAS):\n"
-            "   - Identifique qual é o tipo do documento de forma clara e direta.\n"
-            "   - Use uma palavra só, em MAIÚSCULAS, sem acento.\n"
-            "   - Seja específico: FATURA, CONTRATO, RECIBO, NOTAFISCAL, "
-            "EXTRATO, PROPOSTA, RELATORIO, HOLERITE, BOLETO, COMPROVANTE, "
-            "ORCAMENTO, CURRICULO, ATA, OFICIO, etc.\n"
-            "   - Escolha sempre o termo mais preciso pro conteúdo real.\n\n"
-            "3) Descricao (terceira parte, em CamelCase):\n"
-            "   - Descrição curta com detalhes que diferenciam este documento "
-            "(data, número, mês, assunto).\n"
-            "   - Use CamelCase: primeira letra de cada palavra em maiúscula, "
-            "sem espaços (ex: Janeiro2026, Pedido12345, ReuniaoMarketing).\n"
-            "   - Máximo 40 caracteres nesta parte.\n\n"
-            "REGRAS GERAIS:\n"
-            "- Responda APENAS com o nome final, nada mais.\n"
-            "- NÃO use markdown, aspas ou explicações.\n"
-            "- NÃO inclua a extensão do arquivo.\n"
-            "- Use APENAS letras (sem acento), números e underline (_).\n"
-            "- As três partes são separadas por UM underline (_).\n"
-            "- Total máximo: 80 caracteres.\n\n"
-            "EXEMPLOS DE RESPOSTAS CORRETAS:\n"
-            "VIVO_FATURA_Janeiro2026\n"
-            "JOAOSILVA_CONTRATO_AluguelImovel2025\n"
-            "MERCADOLIVRE_NOTAFISCAL_Pedido98765\n"
-            "BANCOITAU_EXTRATO_Dezembro2025\n"
-            "MICROSOFT_PROPOSTA_LicencaOffice2026\n"
-            "RH_HOLERITE_Maio2026\n"
+            "Analise o conteúdo deste arquivo e gere o NOME ABREVIADO do documento "
+            "seguindo o padrão de nomenclatura da Expanzio (regularização imobiliária).\n\n"
+            "OBJETIVO: criar uma abreviação curta e clara que identifique o documento, "
+            "no estilo dos exemplos abaixo.\n\n"
+            "EXEMPLOS DE NOMES ABREVIADOS CORRETOS:\n"
+            "- Ata de Reunião → ATA\n"
+            "- Cronograma de Legalização → CRONOGRAMA\n"
+            "- ART de Execução de Obras do Eng. Marcos David → ART. EXEC. OBRA MARCOS\n"
+            "- Certidão de Ônus → CERT. ONUS\n"
+            "- Licença de Funcionamento de 2025 → LIC. FUNC. 2025\n"
+            "- RRT de Execução de Obras do Bruno Caetano → RRT EXE. OBRA BRUNO\n"
+            "- RRT para Elaboração de Projetos do Bruno Caetano → RRT PROJ. BRUNO\n"
+            "- Notificação de Exigências Nº 169/2022 (Canteiro de Obras) → "
+            "NOT. EXIG. CANTEIRO 169-22\n"
+            "- Notificação de Exigências Nº 29/2023 (Engenho Publicitário) → "
+            "NOT. EXIG. PUBLI. 29-23\n"
+            "- Notificação de Exigências Nº 794/2023 (Estudo Prévio) → "
+            "NOT. EXIG. EP. 794-23\n"
+            "- Notificação de Exigências Nº 122071912/2023 (Alvará de Construção) → "
+            "NOT. EXIG. ALVARA 122071912-23\n"
+            "- Certidão Negativa de Débitos do DF Legal → CND DF LEGAL\n\n"
+            "REGRAS DE ABREVIAÇÃO:\n"
+            "- Use TODAS em MAIÚSCULAS (sem acentos).\n"
+            "- Abrevie ao máximo MAS mantenha a identificação clara.\n"
+            "- Pode usar PONTO após abreviações (ex: LIC., CERT., EXEC.).\n"
+            "- Pode usar ESPAÇOS entre palavras.\n"
+            "- Inclua datas/números quando relevantes (ano, número do processo).\n"
+            "- Para datas curtas use formato ANO-MES ou só o ANO (ex: 29-23 = nº 29 do "
+            "ano 2023; 2025 = ano).\n"
+            "- NÃO inclua nome do cliente, NÃO inclua numeração sequencial, "
+            "NÃO inclua revisão (R00, R01).\n"
+            "- NÃO inclua extensão do arquivo.\n"
+            "- Máximo de 50 caracteres.\n\n"
+            "RESPONDA APENAS COM O NOME ABREVIADO. Sem markdown, sem aspas, sem "
+            "explicações, sem texto adicional. Apenas a abreviação."
         )
 
         # 3) Chama o modelo passando o prompt + o arquivo
@@ -175,7 +189,10 @@ def gerar_nome_via_gemini(conteudo_bytes: bytes,
         resposta = modelo.generate_content([prompt, arquivo_no_gemini])
 
         nome_bruto = resposta.text or ""
-        return higienizar_nome(nome_bruto, extensao)
+        # Higieniza usando extensão vazia: queremos apenas o NOME ABREVIADO,
+        # sem extensão (que será adicionada depois no montar_nome_padrao_expanzio)
+        nome_higienizado = higienizar_nome(nome_bruto, "")
+        return nome_higienizado
 
     finally:
         # Limpeza: apaga o arquivo temporário local
@@ -194,7 +211,6 @@ def gerar_nome_via_gemini(conteudo_bytes: bytes,
 def gerar_nome_com_retry(conteudo_bytes: bytes,
                          nome_original: str,
                          api_key: str,
-                         cliente_manual: str = "",
                          callback_status=None) -> str:
     """
     Envolve a chamada ao Gemini com retry automático em caso de rate limit.
@@ -207,9 +223,7 @@ def gerar_nome_com_retry(conteudo_bytes: bytes,
 
     for tentativa in range(1, MAX_TENTATIVAS + 1):
         try:
-            return gerar_nome_via_gemini(
-                conteudo_bytes, nome_original, api_key, cliente_manual
-            )
+            return gerar_nome_via_gemini(conteudo_bytes, nome_original, api_key)
         except Exception as erro:
             ultimo_erro = erro
             msg = str(erro).lower()
@@ -422,9 +436,9 @@ with st.sidebar:
         )
 
     st.markdown("---")
-    st.markdown("**📐 Padrão de nomenclatura:**")
-    st.code("CLIENTE_TIPO_Descricao", language=None)
-    st.caption("Ex: VIVO_FATURA_Janeiro2026")
+    st.markdown("**📐 Padrão Expanzio:**")
+    st.code("CLIENTE-000-NOME ABREVIADO-REVISÃO", language=None)
+    st.caption("Ex: DIA-003-NOT. EXIG. PUBLI. 29-23-R00")
 
     st.markdown("---")
     st.markdown(
@@ -441,46 +455,87 @@ arquivos_enviados = st.file_uploader(
     accept_multiple_files=True,
 )
 
-# Campo opcional pro usuário informar o cliente
-# (se informado, todos os arquivos serão nomeados com esse cliente)
-cliente_manual_raw = st.text_input(
-    "Cliente (opcional)",
-    placeholder="Ex: VIVO, BANCO ITAÚ, JOÃO SILVA — deixe vazio pra IA detectar automaticamente",
+# =========================================================================
+# CAMPOS DO PADRÃO EXPANZIO
+# =========================================================================
+# O usuário define CLIENTE, número inicial e revisão.
+# A IA gera apenas a parte central (NOME ABREVIADO) baseada no conteúdo.
+
+st.markdown("### Padrão de nomenclatura")
+st.caption("Formato final: `CLIENTE-000-NOME ABREVIADO-REVISÃO.ext`")
+
+# Cliente — obrigatório
+cliente_raw = st.text_input(
+    "Cliente",
+    placeholder="Ex: DIA, BK, SMART, GUSTAVO NINOMIA, TOLLSTADIUS",
     help=(
-        "Se você preencher, este nome será usado como CLIENTE em TODOS os arquivos "
-        "deste processamento. Se deixar vazio, a IA tenta identificar pelo conteúdo "
-        "de cada documento."
+        "Abreviação do cliente, conforme padrão Expanzio. "
+        "Para corporativos: sigla (DIA, BK, SMART). "
+        "Para residenciais: nome + sobrenome ou só sobrenome marcante."
     ),
 )
 
-# Higieniza o cliente manual: vira MAIÚSCULAS, sem espaços, sem acentos
-def _formatar_cliente_manual(texto: str) -> str:
+# Higieniza o cliente: mantém letras/números/espaços, vira maiúsculas, sem acentos
+def _formatar_cliente(texto: str) -> str:
     import unicodedata
     if not texto:
         return ""
     # Remove acentos
     nfkd = unicodedata.normalize("NFKD", texto)
     sem_acento = "".join(c for c in nfkd if not unicodedata.combining(c))
-    # Mantém só letras e números, vira MAIÚSCULAS, sem espaços
-    limpo = re.sub(r"[^a-zA-Z0-9]", "", sem_acento).upper()
+    # Mantém letras, números e espaços; vira MAIÚSCULAS
+    limpo = re.sub(r"[^a-zA-Z0-9 ]", "", sem_acento).upper()
+    # Colapsa espaços múltiplos
+    limpo = re.sub(r" +", " ", limpo).strip()
     return limpo
 
-cliente_manual = _formatar_cliente_manual(cliente_manual_raw)
+cliente = _formatar_cliente(cliente_raw)
 
-# Mostra preview do que vai virar (útil se o usuário digitou com acentos/espaços)
-if cliente_manual_raw and cliente_manual != cliente_manual_raw:
-    st.caption(f"✏️ Cliente formatado: `{cliente_manual}`")
+if cliente_raw and cliente != cliente_raw.upper():
+    st.caption(f"✏️ Cliente formatado: `{cliente}`")
+
+# Linha com dois campos: número inicial e revisão
+col1, col2 = st.columns(2)
+
+with col1:
+    numero_inicial = st.number_input(
+        "Número inicial",
+        min_value=1,
+        max_value=999,
+        value=1,
+        step=1,
+        help=(
+            "Numeração sequencial. O primeiro arquivo recebe este número, "
+            "o segundo recebe +1, e assim por diante (001, 002, 003...). "
+            "Use um número maior se a pasta já tem arquivos."
+        ),
+    )
+
+with col2:
+    revisao = st.text_input(
+        "Revisão",
+        value="R00",
+        max_chars=5,
+        help=(
+            "R00 = primeira versão. Apenas incremente (R01, R02...) "
+            "se os arquivos forem revisões já solicitadas."
+        ),
+    )
 
 if arquivos_enviados:
     st.info(f"📎 {len(arquivos_enviados)} arquivo(s) selecionado(s).")
 
 # Avisos para o usuário antes de processar
-botao_desabilitado = not (arquivos_enviados and api_key)
+botao_desabilitado = not (arquivos_enviados and api_key and cliente)
+
 if arquivos_enviados and not api_key:
     st.error(
         "⚠️ A chave da API não foi configurada pelo administrador. "
         "Contate o responsável pela aplicação."
     )
+
+if arquivos_enviados and not cliente:
+    st.warning("⚠️ Informe o nome do cliente para continuar.")
 
 processar = st.button(
     "🚀 Processar Arquivos",
@@ -516,17 +571,30 @@ if processar:
             def avisar(msg):
                 placeholder_status.info(msg)
 
-            # Chama a IA com retry automático em caso de rate limit
-            novo_nome = gerar_nome_com_retry(
+            # 1) Chama a IA pra gerar APENAS o NOME ABREVIADO
+            nome_abreviado = gerar_nome_com_retry(
                 conteudo_bytes=conteudo,
                 nome_original=arquivo.name,
                 api_key=api_key,
-                cliente_manual=cliente_manual,
                 callback_status=avisar,
             )
+
+            # 2) Monta o nome final no padrão Expanzio:
+            #    CLIENTE-000-NOME ABREVIADO-REVISÃO.ext
+            extensao = os.path.splitext(arquivo.name)[1].lower()
+            numero_atual = int(numero_inicial) + (indice - 1)
+            novo_nome = montar_nome_padrao_expanzio(
+                cliente=cliente,
+                numero=numero_atual,
+                nome_abreviado=nome_abreviado,
+                revisao=revisao,
+                extensao=extensao,
+            )
+
+            # 3) Garante que não há nomes duplicados (raro, mas pode acontecer)
             novo_nome = evitar_nome_duplicado(novo_nome, nomes_ja_usados)
 
-            # Salva o arquivo com o novo nome na pasta temporária
+            # 4) Salva o arquivo com o novo nome na pasta temporária
             caminho_destino = os.path.join(pasta_temp, novo_nome)
             with open(caminho_destino, "wb") as f:
                 f.write(conteudo)
