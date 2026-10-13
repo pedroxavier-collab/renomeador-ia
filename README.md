@@ -44,6 +44,8 @@ ANTHROPIC_API_KEY = "sua-chave"
 # Opcional. Padrão: claude-haiku-5-5 (mais rápido e barato).
 # Se a leitura errar muito, teste: claude-sonnet-5-5
 # CLAUDE_MODEL = "claude-sonnet-5-5"
+# Só se a chave não tiver sido criada dentro de um workspace:
+# ANTHROPIC_WORKSPACE_ID = "wrkspc_..."
 
 # Gemini (só precisa se IA_PROVEDOR = "gemini")
 GEMINI_API_KEY = "sua-chave"

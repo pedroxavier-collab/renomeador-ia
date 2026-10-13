@@ -22,6 +22,8 @@ Configuração (Secrets do Streamlit ou variáveis de ambiente):
   GITHUB_BRANCH      -> ramo do repositório (opcional; padrão "main")
   ANTHROPIC_API_KEY  -> chave da API do Claude (se IA_PROVEDOR = claude)
   CLAUDE_MODEL       -> modelo do Claude (opcional)
+  ANTHROPIC_WORKSPACE_ID -> ID do workspace (só se a chave não for de um
+                        workspace específico; começa com "wrkspc_")
   GEMINI_API_KEY     -> chave da API do Gemini (se IA_PROVEDOR = gemini)
   GEMINI_MODEL       -> modelo do Gemini (opcional)
 """
@@ -161,10 +163,38 @@ PROMPT = (
     "a partir de prazos (ex: 'válido por 90 dias').\n"
     "- Formato AAAA-MM-DD.\n"
     "- Se não houver a data no documento, use null.\n\n"
-    "RESPONDA APENAS COM UM JSON NESTE FORMATO, sem markdown e sem texto adicional:\n"
-    '{"nome_abreviado": "...", "data_emissao": "AAAA-MM-DD" ou null, '
-    '"data_vencimento": "AAAA-MM-DD" ou null}'
+    "RESPONDA APENAS COM UM JSON com as chaves nome_abreviado, data_emissao e "
+    "data_vencimento (use null nas datas que não existirem), sem markdown e sem "
+    "texto adicional. Exemplo de formato:\n"
+    '{"nome_abreviado": "CND DF LEGAL", "data_emissao": "2026-01-10", '
+    '"data_vencimento": null}'
 )
+
+
+# Formato da resposta do Claude. Com "tool_choice" forçado, o Claude é
+# obrigado a responder preenchendo exatamente estes campos.
+FERRAMENTA_CLAUDE = {
+    "name": "registrar_documento",
+    "description": "Registra o nome abreviado e as datas do documento analisado.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "nome_abreviado": {
+                "type": "string",
+                "description": "Nome abreviado no padrão Expanzio, ou INDEFINIDO.",
+            },
+            "data_emissao": {
+                "type": ["string", "null"],
+                "description": "Data de emissão no formato AAAA-MM-DD, ou null.",
+            },
+            "data_vencimento": {
+                "type": ["string", "null"],
+                "description": "Data de vencimento no formato AAAA-MM-DD, ou null.",
+            },
+        },
+        "required": ["nome_abreviado", "data_emissao", "data_vencimento"],
+    },
+}
 
 
 # =========================================================================
@@ -241,13 +271,22 @@ def interpretar_resposta(texto: str) -> dict:
         dados = {}
 
     if not dados:
-        return {"nome": higienizar_nome_abreviado(texto),
-                "emissao": None, "vencimento": None}
+        # JSON quebrado: tenta achar ao menos os campos pelo texto
+        def campo(nome_campo):
+            achado = re.search(rf'"{nome_campo}"\s*:\s*"([^"]*)"', texto)
+            return achado.group(1) if achado else None
+        nome = campo("nome_abreviado")
+        if nome is None and not texto.lstrip().startswith(("{", "`")):
+            nome = texto  # a IA respondeu só o nome, sem JSON
+        dados = {"nome_abreviado": nome or "",
+                 "data_emissao": campo("data_emissao"),
+                 "data_vencimento": campo("data_vencimento")}
 
     return {
         "nome": higienizar_nome_abreviado(dados.get("nome_abreviado") or ""),
         "emissao": ler_data(dados.get("data_emissao")),
         "vencimento": ler_data(dados.get("data_vencimento")),
+        "resposta_ia": texto,
     }
 
 
@@ -309,7 +348,8 @@ def eh_problema_de_conta(erro: Exception) -> bool:
     """Erro de créditos, limite de gasto ou chave, que não depende do arquivo."""
     texto = mensagem_da_api(erro).lower()
     return any(p in texto for p in
-               ("credit balance", "usage limit", "billing", "api key", "api_key"))
+               ("credit balance", "usage limit", "billing", "api key", "api_key",
+                "workspace"))
 
 
 def mensagem_amigavel(erro: Exception, modelo: str, secret_modelo: str) -> str:
@@ -327,6 +367,10 @@ def mensagem_amigavel(erro: Exception, modelo: str, secret_modelo: str) -> str:
         return "Serviço de IA sobrecarregado. Tente de novo em alguns minutos."
     if "credit balance" in texto:
         return "Os créditos da API acabaram. Fale com o responsável pelo app."
+    if "workspace" in texto:
+        return ("A chave do Claude não está ligada a um workspace. Crie uma chave "
+                "dentro de um workspace no Console da Anthropic ou cadastre "
+                "ANTHROPIC_WORKSPACE_ID nos Secrets.")
     if "usage limit" in texto:
         return ("O limite de gasto da API foi atingido (definido no Console da "
                 "Anthropic). Fale com o responsável pelo app.")
@@ -383,13 +427,19 @@ def chamar_claude(cliente_ia: anthropic.Anthropic, modelo: str,
                   blocos_arquivo: list[dict]) -> str:
     resposta = cliente_ia.messages.create(
         model=modelo,
-        max_tokens=300,
+        max_tokens=500,
+        tools=[FERRAMENTA_CLAUDE],
+        tool_choice={"type": "tool", "name": FERRAMENTA_CLAUDE["name"]},
         messages=[{
             "role": "user",
             # O arquivo vem antes da pergunta, como recomenda a documentação
             "content": blocos_arquivo + [{"type": "text", "text": PROMPT}],
         }],
     )
+    for bloco in resposta.content:
+        if bloco.type == "tool_use":
+            return json.dumps(bloco.input, ensure_ascii=False)
+    # Se por algum motivo não vier a ferramenta, usa o texto
     return "".join(b.text for b in resposta.content if b.type == "text")
 
 
@@ -473,7 +523,11 @@ def criar_cliente_ia(provedor: str, api_key: str):
     if provedor == "claude":
         # max_retries=0: as novas tentativas são feitas por este app,
         # que mostra na tela quanto tempo está esperando
-        return anthropic.Anthropic(api_key=api_key, max_retries=0)
+        # Chaves que não pertencem a um workspace precisam dizer qual usar
+        workspace = ler_configuracao("ANTHROPIC_WORKSPACE_ID").strip()
+        cabecalhos = {"anthropic-workspace-id": workspace} if workspace else None
+        return anthropic.Anthropic(api_key=api_key, max_retries=0,
+                                   default_headers=cabecalhos)
     return genai.Client(api_key=api_key)
 
 
@@ -873,7 +927,10 @@ if gerar:
                 avisar=aviso.info,
             )
             if analise["nome"] in ("", "INDEFINIDO"):
+                resposta_ia = (analise.get("resposta_ia") or "").strip()
                 erro_texto = "A IA não identificou o documento. Preencha manualmente."
+                if resposta_ia and analise["nome"] != "INDEFINIDO":
+                    erro_texto += f" Resposta da IA: {resposta_ia[:300]}"
                 analise["nome"] = ""
         except Exception as erro:
             erro_texto = "Erro: " + mensagem_amigavel(
