@@ -38,8 +38,11 @@ import zipfile
 from datetime import date, datetime
 from pathlib import Path
 
+from PIL import Image
+
 import anthropic
 import pandas as pd
+import pypdfium2 as pdfium
 import requests
 import streamlit as st
 from google import genai
@@ -101,6 +104,13 @@ FORMATO_DATA_NOME = "%d.%m.%Y"
 # Claude: a requisição inteira pode ter até 32 MB, e o arquivo cresce cerca
 # de 1/3 ao ser codificado. Por isso o limite do arquivo fica em 20 MB.
 LIMITE_CLAUDE_MB = 20
+# Imagens maiores que isso são reduzidas antes do envio (a API recusa
+# imagens muito pesadas). Lado maior em pixels, como recomenda a documentação.
+LIMITE_IMAGEM_MB = 3.5
+LADO_MAX_IMAGEM = 1568
+# Se a API recusar um PDF (protegido, assinado digitalmente, corrompido...),
+# o app tenta de novo enviando as primeiras páginas como imagem.
+PAGINAS_COMO_IMAGEM = 3
 # Gemini: arquivos até este tamanho vão direto na chamada; acima disso,
 # upload temporário (apagado logo depois).
 LIMITE_GEMINI_DIRETO_MB = 15
@@ -263,6 +273,10 @@ class ArquivoGrandeDemais(Exception):
     """Arquivo maior do que a IA aceita numa chamada."""
 
 
+class ArquivoProtegido(Exception):
+    """PDF que só abre com senha."""
+
+
 def codigo_http(erro: Exception):
     """Código de status HTTP do erro (429, 401...), se houver."""
     if isinstance(erro, anthropic.APIStatusError):
@@ -277,12 +291,34 @@ def vale_tentar_de_novo(erro: Exception) -> bool:
     return codigo_http(erro) in (429, 529) or "RESOURCE_EXHAUSTED" in str(erro)
 
 
+def mensagem_da_api(erro: Exception) -> str:
+    """Só o texto da mensagem que a API devolveu, sem código e JSON em volta."""
+    if isinstance(erro, anthropic.APIStatusError):
+        corpo = erro.body
+        if isinstance(corpo, dict):
+            mensagem = (corpo.get("error") or {}).get("message")
+            if mensagem:
+                return mensagem
+        return erro.message
+    if isinstance(erro, gemini_errors.APIError):
+        return erro.message or str(erro)
+    return str(erro)
+
+
+def eh_problema_de_conta(erro: Exception) -> bool:
+    """Erro de créditos, limite de gasto ou chave, que não depende do arquivo."""
+    texto = mensagem_da_api(erro).lower()
+    return any(p in texto for p in
+               ("credit balance", "usage limit", "billing", "api key", "api_key"))
+
+
 def mensagem_amigavel(erro: Exception, modelo: str, secret_modelo: str) -> str:
     """Traduz os erros mais comuns para algo que a equipe entenda."""
     codigo = codigo_http(erro)
-    texto = str(erro).lower()
+    mensagem = mensagem_da_api(erro)
+    texto = mensagem.lower()
 
-    if isinstance(erro, ArquivoGrandeDemais):
+    if isinstance(erro, (ArquivoGrandeDemais, ArquivoProtegido)):
         return str(erro)
     if codigo == 429 or "resource_exhausted" in texto:
         return ("Limite de requisições da API atingido mesmo após novas "
@@ -291,6 +327,9 @@ def mensagem_amigavel(erro: Exception, modelo: str, secret_modelo: str) -> str:
         return "Serviço de IA sobrecarregado. Tente de novo em alguns minutos."
     if "credit balance" in texto:
         return "Os créditos da API acabaram. Fale com o responsável pelo app."
+    if "usage limit" in texto:
+        return ("O limite de gasto da API foi atingido (definido no Console da "
+                "Anthropic). Fale com o responsável pelo app.")
     if codigo in (401, 403) or "api key not valid" in texto:
         return "Chave da API inválida ou sem permissão."
     if codigo == 404:
@@ -298,9 +337,60 @@ def mensagem_amigavel(erro: Exception, modelo: str, secret_modelo: str) -> str:
                 f"Ajuste {secret_modelo} nos Secrets do Streamlit.")
     if codigo == 413:
         return "Arquivo grande demais para a IA. Preencha o nome manualmente."
-    if codigo == 400 and "page" in texto:
-        return "PDF com páginas demais para a IA. Preencha o nome manualmente."
-    return str(erro)
+    if "password" in texto or "encrypt" in texto:
+        return "PDF protegido por senha. Preencha o nome manualmente."
+    if codigo == 400:
+        return f"A IA recusou o arquivo: {mensagem}"
+    return mensagem
+
+
+def bloco_imagem(dados: bytes, mime: str) -> dict:
+    return {"type": "image",
+            "source": {"type": "base64", "media_type": mime,
+                       "data": base64.standard_b64encode(dados).decode("utf-8")}}
+
+
+def reduzir_imagem(dados: bytes, mime: str) -> tuple[bytes, str]:
+    """Reduz fotos muito pesadas para caberem no limite da API."""
+    if len(dados) <= LIMITE_IMAGEM_MB * 1024 * 1024:
+        return dados, mime
+    imagem = Image.open(io.BytesIO(dados)).convert("RGB")
+    imagem.thumbnail((LADO_MAX_IMAGEM, LADO_MAX_IMAGEM))
+    buffer = io.BytesIO()
+    imagem.save(buffer, "JPEG", quality=85)
+    return buffer.getvalue(), "image/jpeg"
+
+
+def pdf_para_imagens(conteudo: bytes) -> list[bytes]:
+    """Transforma as primeiras páginas do PDF em imagens JPEG."""
+    pdf = pdfium.PdfDocument(conteudo)
+    try:
+        imagens = []
+        for indice in range(min(len(pdf), PAGINAS_COMO_IMAGEM)):
+            pagina = pdf[indice]
+            largura, altura = pagina.get_size()
+            escala = LADO_MAX_IMAGEM / max(largura, altura)
+            figura = pagina.render(scale=escala).to_pil().convert("RGB")
+            buffer = io.BytesIO()
+            figura.save(buffer, "JPEG", quality=85)
+            imagens.append(buffer.getvalue())
+        return imagens
+    finally:
+        pdf.close()
+
+
+def chamar_claude(cliente_ia: anthropic.Anthropic, modelo: str,
+                  blocos_arquivo: list[dict]) -> str:
+    resposta = cliente_ia.messages.create(
+        model=modelo,
+        max_tokens=300,
+        messages=[{
+            "role": "user",
+            # O arquivo vem antes da pergunta, como recomenda a documentação
+            "content": blocos_arquivo + [{"type": "text", "text": PROMPT}],
+        }],
+    )
+    return "".join(b.text for b in resposta.content if b.type == "text")
 
 
 def perguntar_ao_claude(cliente_ia: anthropic.Anthropic, modelo: str,
@@ -311,32 +401,40 @@ def perguntar_ao_claude(cliente_ia: anthropic.Anthropic, modelo: str,
             f"Arquivo acima de {LIMITE_CLAUDE_MB} MB. Preencha o nome manualmente."
         )
 
-    mime = MIME_POR_EXTENSAO[extensao]
-    dados_b64 = base64.standard_b64encode(conteudo).decode("utf-8")
-
-    if extensao == ".pdf":
-        bloco_arquivo = {"type": "document",
-                         "source": {"type": "base64", "media_type": mime,
-                                    "data": dados_b64}}
-    elif extensao == ".txt":
+    if extensao == ".txt":
         texto = conteudo.decode("utf-8", errors="replace")[:100_000]
-        bloco_arquivo = {"type": "text",
-                         "text": f"CONTEÚDO DO ARQUIVO:\n\n{texto}"}
-    else:  # imagens
-        bloco_arquivo = {"type": "image",
-                         "source": {"type": "base64", "media_type": mime,
-                                    "data": dados_b64}}
+        return chamar_claude(cliente_ia, modelo, [
+            {"type": "text", "text": f"CONTEÚDO DO ARQUIVO:\n\n{texto}"}
+        ])
 
-    resposta = cliente_ia.messages.create(
-        model=modelo,
-        max_tokens=300,
-        messages=[{
-            "role": "user",
-            # O arquivo vem antes da pergunta, como recomenda a documentação
-            "content": [bloco_arquivo, {"type": "text", "text": PROMPT}],
-        }],
-    )
-    return "".join(b.text for b in resposta.content if b.type == "text")
+    if extensao in (".png", ".jpg", ".jpeg"):
+        dados, mime = reduzir_imagem(conteudo, MIME_POR_EXTENSAO[extensao])
+        return chamar_claude(cliente_ia, modelo, [bloco_imagem(dados, mime)])
+
+    # PDF: primeiro como documento, que é o jeito mais completo de leitura
+    bloco_pdf = {"type": "document",
+                 "source": {"type": "base64", "media_type": "application/pdf",
+                            "data": base64.standard_b64encode(conteudo).decode("utf-8")}}
+    try:
+        return chamar_claude(cliente_ia, modelo, [bloco_pdf])
+    except anthropic.BadRequestError as erro:
+        if eh_problema_de_conta(erro):
+            raise
+        # A API recusou o PDF. Tenta de novo com as primeiras páginas em imagem.
+        try:
+            imagens = pdf_para_imagens(conteudo)
+        except pdfium.PdfiumError as erro_pdf:
+            if "password" in str(erro_pdf).lower():
+                raise ArquivoProtegido(
+                    "PDF protegido por senha. Preencha o nome manualmente."
+                ) from erro
+            raise erro
+        except Exception:
+            raise erro
+        if not imagens:
+            raise erro
+        return chamar_claude(cliente_ia, modelo,
+                             [bloco_imagem(img, "image/jpeg") for img in imagens])
 
 
 def perguntar_ao_gemini(cliente_ia: genai.Client, modelo: str,
@@ -842,6 +940,7 @@ if resultados:
         width="stretch",
         num_rows="fixed",
         disabled=["Arquivo original", "Observação"],
+        placeholder="—",
         column_config={
             "Arquivo original": st.column_config.TextColumn(width="medium"),
             "Nome abreviado": st.column_config.TextColumn(
@@ -852,6 +951,12 @@ if resultados:
             "Observação": st.column_config.TextColumn(width="medium"),
         },
     )
+
+    if falhas:
+        with st.expander(f"Ver o motivo completo ({falhas} arquivo(s) para preencher)"):
+            for r in resultados:
+                if r["observacao"]:
+                    st.markdown(f"**{r['original']}**  \n{r['observacao']}")
 
     # ---- Monta os nomes finais e confere problemas ----------------------
     problemas = []
