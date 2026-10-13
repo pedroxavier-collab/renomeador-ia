@@ -17,6 +17,9 @@ Exemplos:     DIA-NOT. EXIG. PUBLI. 29-23.pdf
 
 Configuração (Secrets do Streamlit ou variáveis de ambiente):
   IA_PROVEDOR        -> "claude" (padrão) ou "gemini"
+  GITHUB_TOKEN       -> token para salvar clientes novos no repositório (opcional)
+  GITHUB_REPO        -> repositório no formato "usuario/nome-do-repo" (opcional)
+  GITHUB_BRANCH      -> ramo do repositório (opcional; padrão "main")
   ANTHROPIC_API_KEY  -> chave da API do Claude (se IA_PROVEDOR = claude)
   CLAUDE_MODEL       -> modelo do Claude (opcional)
   GEMINI_API_KEY     -> chave da API do Gemini (se IA_PROVEDOR = gemini)
@@ -24,11 +27,12 @@ Configuração (Secrets do Streamlit ou variáveis de ambiente):
 """
 
 import base64
+import csv
 import io
+import json
 import os
 import re
 import time
-import json
 import unicodedata
 import zipfile
 from datetime import date, datetime
@@ -36,6 +40,7 @@ from pathlib import Path
 
 import anthropic
 import pandas as pd
+import requests
 import streamlit as st
 from google import genai
 from google.genai import errors as gemini_errors
@@ -49,6 +54,10 @@ from google.genai import types as gemini_types
 PASTA_APP = Path(__file__).parent
 CAMINHO_LOGO = PASTA_APP / "assets" / "assinatura-branca-mais-laranja.png"
 CAMINHO_ICONE = PASTA_APP / "assets" / "simbolo-branco-mais-laranja.png"
+
+# Lista de clientes (colunas: Cliente, Sigla). A sigla, quando preenchida,
+# é o que vai no nome do arquivo; sem sigla, vai o nome do cliente.
+CAMINHO_CLIENTES = PASTA_APP / "clientes.csv"
 
 # Provedores de IA disponíveis. Qual usar é definido por IA_PROVEDOR nos
 # Secrets; chave e modelo de cada um também ficam nos Secrets.
@@ -398,6 +407,115 @@ def gerar_com_novas_tentativas(provedor, cliente_ia, modelo, conteudo,
 
 
 # =========================================================================
+# LISTA DE CLIENTES
+# =========================================================================
+
+def chave_cliente(nome: str) -> str:
+    """Compara nomes ignorando maiúsculas, acentos e pontuação."""
+    return re.sub(r"[^a-z0-9]", "", remover_acentos(nome or "").lower())
+
+
+def ler_clientes_csv(texto: str) -> list[dict]:
+    """Lê o conteúdo do clientes.csv e devolve [{"Cliente": ..., "Sigla": ...}]."""
+    clientes = []
+    for linha in csv.DictReader(io.StringIO(texto)):
+        nome = (linha.get("Cliente") or "").strip()
+        if nome:
+            clientes.append({"Cliente": nome, "Sigla": (linha.get("Sigla") or "").strip()})
+    return clientes
+
+
+def linha_csv(nome: str, sigla: str) -> str:
+    buffer = io.StringIO()
+    csv.writer(buffer, lineterminator="\n").writerow([nome, sigla])
+    return buffer.getvalue()
+
+
+def carregar_clientes() -> list[dict]:
+    """Clientes do arquivo + os adicionados nesta sessão, sem repetição, em ordem alfabética."""
+    clientes = []
+    if CAMINHO_CLIENTES.exists():
+        clientes = ler_clientes_csv(CAMINHO_CLIENTES.read_text(encoding="utf-8"))
+    clientes += st.session_state.get("clientes_adicionados", [])
+
+    unicos = {}
+    for c in clientes:
+        unicos.setdefault(chave_cliente(c["Cliente"]), c)
+    return sorted(unicos.values(), key=lambda c: chave_cliente(c["Cliente"]))
+
+
+def github_configurado() -> bool:
+    return bool(ler_configuracao("GITHUB_TOKEN") and ler_configuracao("GITHUB_REPO"))
+
+
+def salvar_cliente_no_github(nome: str, sigla: str) -> str:
+    """
+    Acrescenta o cliente ao clientes.csv do repositório no GitHub (fica salvo
+    de vez) e devolve o conteúdo atualizado do arquivo.
+    """
+    repo = ler_configuracao("GITHUB_REPO")
+    ramo = ler_configuracao("GITHUB_BRANCH", "main")
+    url = f"https://api.github.com/repos/{repo}/contents/{CAMINHO_CLIENTES.name}"
+    cabecalhos = {
+        "Authorization": f"Bearer {ler_configuracao('GITHUB_TOKEN')}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+    # Duas tentativas: se duas pessoas salvarem ao mesmo tempo, o GitHub
+    # recusa a segunda (409) e ela tenta de novo com o arquivo atualizado
+    for tentativa in range(2):
+        resposta = requests.get(url, headers=cabecalhos, params={"ref": ramo}, timeout=15)
+        resposta.raise_for_status()
+        dados = resposta.json()
+        texto = base64.b64decode(dados["content"]).decode("utf-8")
+
+        if any(chave_cliente(c["Cliente"]) == chave_cliente(nome)
+               for c in ler_clientes_csv(texto)):
+            return texto  # alguém já salvou esse cliente
+
+        novo_texto = texto.rstrip("\n") + "\n" + linha_csv(nome, sigla)
+        envio = requests.put(url, headers=cabecalhos, timeout=15, json={
+            "message": f"RenomIAdor: novo cliente {nome}",
+            "content": base64.b64encode(novo_texto.encode("utf-8")).decode("ascii"),
+            "sha": dados["sha"],
+            "branch": ramo,
+        })
+        if envio.status_code == 409 and tentativa == 0:
+            continue
+        envio.raise_for_status()
+        return novo_texto
+
+
+def adicionar_cliente(nome: str, sigla: str) -> bool:
+    """
+    Salva um cliente novo. Devolve True se ficou salvo de vez (GitHub) e
+    False se ficou salvo só até o app reiniciar.
+    """
+    nome = re.sub(r"\s+", " ", nome).strip()
+    sigla = formatar_cliente(sigla)
+    st.session_state.setdefault("clientes_adicionados", []).append(
+        {"Cliente": nome, "Sigla": sigla}
+    )
+
+    permanente = False
+    if github_configurado():
+        texto = salvar_cliente_no_github(nome, sigla)
+        permanente = True
+    else:
+        texto = (CAMINHO_CLIENTES.read_text(encoding="utf-8").rstrip("\n") + "\n"
+                 if CAMINHO_CLIENTES.exists() else "Cliente,Sigla\n")
+        texto += linha_csv(nome, sigla)
+
+    # Atualiza a cópia local para a lista já aparecer para todo mundo
+    try:
+        CAMINHO_CLIENTES.write_text(texto, encoding="utf-8")
+    except OSError:
+        pass
+    return permanente
+
+
+# =========================================================================
 # OUTRAS FUNÇÕES
 # =========================================================================
 
@@ -509,11 +627,14 @@ with st.sidebar:
         st.success("Chave da API configurada")
     else:
         st.error("Chave da API não configurada. Fale com o responsável pelo app.")
+    if not github_configurado():
+        st.caption("Clientes novos ficam salvos só até o app reiniciar. "
+                   "Para salvar de vez, configure GITHUB_TOKEN e GITHUB_REPO.")
 
     st.markdown("---")
     st.markdown("**Padrão Expanzio:**")
     st.code("CLIENTE-NOME ABREVIADO\nCLIENTE-NOME ABREVIADO-EMISSÃO-VENCIMENTO",
-            language=None)
+            language=None, wrap_lines=True)
     st.caption("Ex: DIA-NOT. EXIG. PUBLI. 29-23  \n"
                "DIA-LIC. FUNC-10.01.2026-10.01.2027  \n"
                "As datas entram quando o documento tem emissão e vencimento.")
@@ -530,16 +651,62 @@ st.caption("A IA sugere os nomes, você confere e baixa os arquivos renomeados."
 # =========================================================================
 st.markdown("### 1. Informe o cliente")
 
-cliente_digitado = st.text_input(
+clientes = carregar_clientes()
+nomes_clientes = [c["Cliente"] for c in clientes]
+sigla_por_cliente = {c["Cliente"]: c["Sigla"] for c in clientes}
+
+# Depois de salvar um cliente novo, já deixa ele selecionado
+if "cliente_pendente" in st.session_state:
+    st.session_state.cliente_escolhido = st.session_state.pop("cliente_pendente")
+
+escolha = st.selectbox(
     "Cliente",
-    placeholder="Ex: DIA, BK, SMART, GUSTAVO NINOMIA, TOLLSTADIUS",
-    help=("Abreviação do cliente, conforme padrão Expanzio. "
-          "Corporativos: sigla (DIA, BK, SMART). "
-          "Residenciais: nome + sobrenome ou só o sobrenome marcante."),
+    options=nomes_clientes,
+    index=None,
+    key="cliente_escolhido",
+    accept_new_options=True,
+    filter_mode="contains",   # mostra só nomes que contêm o texto digitado
+    placeholder="Digite para pesquisar ou para adicionar um cliente novo",
+    format_func=lambda n: f"{n} ({sigla_por_cliente[n]})" if sigla_por_cliente.get(n) else n,
+    help=("Comece a digitar para filtrar a lista. Se o cliente não existir, "
+          "digite o nome completo e aperte Enter para adicionar."),
 )
-cliente = formatar_cliente(cliente_digitado)
-if cliente_digitado and cliente != cliente_digitado.strip().upper():
-    st.caption(f"Cliente formatado: `{cliente}`")
+
+cliente = ""
+if escolha:
+    # Nome digitado que já existe com outra grafia (ex: "smart fit")
+    existente = next((n for n in nomes_clientes
+                      if chave_cliente(n) == chave_cliente(escolha)), None)
+
+    if escolha in sigla_por_cliente or existente:
+        nome_cliente = existente or escolha
+        if nome_cliente != escolha:
+            st.caption(f"Esse cliente já está na lista como **{nome_cliente}**.")
+        cliente = formatar_cliente(sigla_por_cliente.get(nome_cliente) or nome_cliente)
+    else:
+        st.info(f"**{escolha}** não está na lista de clientes.")
+        col_sigla, col_botao = st.columns([2, 1], vertical_alignment="bottom")
+        with col_sigla:
+            sigla_nova = st.text_input(
+                "Sigla para o nome do arquivo (opcional)",
+                max_chars=20,
+                help="Ex: SMART para Smart Fit. Sem sigla, o nome do arquivo usa o nome do cliente.",
+            )
+        with col_botao:
+            if st.button("Adicionar à lista", width="stretch"):
+                try:
+                    permanente = adicionar_cliente(escolha, sigla_nova)
+                    st.session_state.cliente_pendente = escolha
+                    st.toast("Cliente salvo na lista." if permanente else
+                             "Cliente adicionado até o app reiniciar.")
+                    st.rerun()
+                except requests.RequestException as erro:
+                    st.error(f"Não foi possível salvar o cliente no GitHub: {erro}")
+        # Mesmo sem salvar, dá para usar o nome digitado neste lote
+        cliente = formatar_cliente(sigla_nova or escolha)
+
+if cliente:
+    st.caption(f"No nome do arquivo: `{cliente}`")
 
 
 # =========================================================================

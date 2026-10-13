@@ -11,7 +11,7 @@ Quando o documento tem data de emissão e de vencimento: `CLIENTE-NOME ABREVIADO
 
 ## Como usar
 
-1. Informe o cliente.
+1. Escolha o cliente na lista. Dá para digitar para pesquisar; se o cliente não existir, digite o nome, aperte Enter e clique em **Adicionar à lista**.
 2. Selecione os arquivos (PDF, TXT, PNG, JPG).
 3. Clique em **Gerar sugestões de nome**. A IA lê cada arquivo e sugere o nome abreviado e, se houver, as datas de emissão e vencimento.
 4. Revise a tabela: corrija nomes e datas e preencha os arquivos que a IA não conseguiu ler.
@@ -28,6 +28,7 @@ app.py                  aplicativo
 requirements.txt        bibliotecas usadas
 .streamlit/config.toml  tema visual (cores e fontes da marca)
 assets/                 logo e símbolo oficiais da Expanzio+
+clientes.csv            lista de clientes (colunas Cliente e Sigla)
 ```
 
 ## Configuração (Secrets do Streamlit)
@@ -50,6 +51,22 @@ GEMINI_API_KEY = "sua-chave"
 ```
 
 Trocar de IA ou de modelo é só mudar os Secrets. Não precisa mexer no código.
+
+## Lista de clientes
+
+A lista fica em `clientes.csv`. A coluna **Sigla** é opcional: quando preenchida, é ela que vai no nome do arquivo (ex: Smart Fit → `SMART`); sem sigla, vai o nome do cliente. Para incluir ou corrigir siglas em massa, edite o arquivo direto no GitHub.
+
+Clientes adicionados pelo app só ficam salvos de vez se o app tiver permissão para gravar no repositório. Para isso, acrescente aos Secrets:
+
+```toml
+GITHUB_TOKEN = "token-do-github"
+GITHUB_REPO = "usuario/nome-do-repositorio"
+# GITHUB_BRANCH = "main"   # só se o ramo principal tiver outro nome
+```
+
+O token é criado no GitHub em Settings > Developer settings > Personal access tokens > Fine-grained tokens, com acesso só a este repositório e permissão **Contents: Read and write**. Sem essa configuração, o cliente adicionado vale até o app reiniciar.
+
+A lista contém nomes de clientes, inclusive pessoas físicas: mantenha o repositório **privado**.
 
 ## Rodar no computador
 
